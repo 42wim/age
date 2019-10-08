@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/FiloSottile/age/internal/format"
 	"github.com/FiloSottile/age/internal/stream"
@@ -70,7 +71,7 @@ func Encrypt(dst io.Writer, recipients ...Recipient) (io.WriteCloser, error) {
 }
 
 func Decrypt(src io.Reader, identities ...Identity) (io.Reader, error) {
-	if len(identities) == 0 {
+	if len(identities) == 0 && os.Getenv("SSH_AUTH_SOCK") == "" {
 		return nil, errors.New("no identities specified")
 	}
 
@@ -88,9 +89,22 @@ RecipientsLoop:
 		if r.Type == "scrypt" && len(hdr.Recipients) != 1 {
 			return nil, errors.New("an scrypt recipient must be the only one")
 		}
+		if os.Getenv("SSH_AUTH_SOCK") != "" {
+			var i Identity
+			switch r.Type {
+			case "ssh-ed25519":
+				i = &SSHEd25519Identity{}
+			case "ssh-rsa":
+				i = &SSHRSAIdentity{}
+			}
+			fileKey, err = i.Unwrap(r)
+			if err == nil {
+				break RecipientsLoop
+			}
+		}
 		for _, i := range identities {
 
-			if i.Type() != r.Type {
+			if i.Type() != r.Type && os.Getenv("SSH_AUTH_SOCK") == "" {
 				continue
 			}
 

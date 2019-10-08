@@ -17,12 +17,15 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
+	"os"
 
 	"github.com/FiloSottile/age/internal/format"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 const oaepLabel = "age-tool.com ssh-rsa"
@@ -113,6 +116,23 @@ func (i *SSHRSAIdentity) Unwrap(block *format.Recipient) ([]byte, error) {
 	wrappedKey, err := format.DecodeString(string(block.Body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse ssh-rsa recipient: %v", err)
+	}
+
+	if hasAgent() {
+		sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+		if err != nil {
+			return nil, err
+		}
+		ag := agent.NewClient(sshAgent)
+		m, err := matchAgentHash(ag, hash)
+		if err != nil {
+			return nil, err
+		}
+		s, err := ag.(agent.ExtendedAgent).Extension("ssh-rsa-decrypt@age-tool.com", append(m, wrappedKey...))
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
 	}
 
 	h := sha256.New()
@@ -332,21 +352,44 @@ func (i *SSHEd25519Identity) Unwrap(block *format.Recipient) ([]byte, error) {
 		return nil, fmt.Errorf("failed to parse ssh-ed25519 recipient: %v", err)
 	}
 
-	sH := sha256.New()
-	sH.Write(i.sshKey.Marshal())
-	hh := sH.Sum(nil)
-	if !bytes.Equal(hh[:4], hash) {
-		return nil, errors.New("wrong ssh-ed25519 key")
+	var sharedSecret, theirPublicKey, tweak [32]byte
+
+	if hasAgent() {
+		sshAgent, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+		if err != nil {
+			return nil, err
+		}
+		ag := agent.NewClient(sshAgent)
+		m, err := matchAgentHash(ag, hash)
+		if err != nil {
+			return nil, err
+		}
+		s, err := ag.(agent.ExtendedAgent).Extension("ssh-ed25519-decrypt@age-tool.com", append(publicKey, m...))
+		if err != nil {
+			return nil, err
+		}
+		copy(i.ourPublicKey[:], s[32:])
+		copy(sharedSecret[:], s[:32])
+
+	} else {
+		sH := sha256.New()
+		sH.Write(i.sshKey.Marshal())
+		hh := sH.Sum(nil)
+		if !bytes.Equal(hh[:4], hash) {
+			return nil, errors.New("wrong ssh-ed25519 key")
+		}
 	}
 
-	var sharedSecret, theirPublicKey, tweak [32]byte
 	copy(theirPublicKey[:], publicKey)
-	tH := hkdf.New(sha256.New, nil, i.sshKey.Marshal(), []byte(ed25519Label))
-	if _, err := io.ReadFull(tH, tweak[:]); err != nil {
-		return nil, err
+
+	if !hasAgent() {
+		tH := hkdf.New(sha256.New, nil, i.sshKey.Marshal(), []byte(ed25519Label))
+		if _, err := io.ReadFull(tH, tweak[:]); err != nil {
+			return nil, err
+		}
+		curve25519.ScalarMult(&sharedSecret, &i.secretKey, &theirPublicKey)
+		curve25519.ScalarMult(&sharedSecret, &tweak, &sharedSecret)
 	}
-	curve25519.ScalarMult(&sharedSecret, &i.secretKey, &theirPublicKey)
-	curve25519.ScalarMult(&sharedSecret, &tweak, &sharedSecret)
 
 	salt := make([]byte, 0, 32*2)
 	salt = append(salt, theirPublicKey[:]...)
